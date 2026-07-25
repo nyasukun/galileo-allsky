@@ -72,6 +72,10 @@ collector を起動した後、接続対象の surface ごとに秘密を含ま�
 curl --fail http://127.0.0.1:4318/status
 ```
 
+実行前後の `/status` を比較し、対象 route の counter が増えたことを確認します。Codex CLI なら `agent.codex.requests` または `agent.codex-cli.requests`、Claude Code CLI なら `agent.claude-code-cli.requests` が対象です。
+
+別 Agent の counter だけが増えた場合は到着成功として扱いません。起動環境の `OTEL_EXPORTER_OTLP_HEADERS` が別 route の `X-Allsky-Agent` を上書きしていないか確認します。
+
 `last_success_at`、実行 surface、製品 version、日時、Log stream、到着の有無、collector error type を記録します。
 
 API key、prompt 本文、tool output、HMAC 値は記録しません。

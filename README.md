@@ -74,6 +74,8 @@ chmod 600 ~/.config/galileo-allsky/collector.env
 
 collector を起動したら、対象 Agent のガイドにある設定を一つだけ適用します。
 
+Codex と Claude Code を同じ shell から使う場合、Claude 用の `OTEL_*` を `.bashrc`、`.zshrc` などへ global export しません。Claude の `~/.claude/settings.json` または process 専用 environment に限定しないと、Codex の `X-Allsky-Agent` を上書きして別の Log stream へ誤配送することがあります。
+
 ```sh
 .venv/bin/allsky-collector \
   --env-file ~/.config/galileo-allsky/collector.env
