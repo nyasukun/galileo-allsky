@@ -25,6 +25,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceResponse,
 )
 
+from .aggregator import ConversationAggregator, ReleasedTurn, sweeper
 from .config import LISTEN_HOST, Settings
 from .forwarder import GalileoForwarder, UpstreamError
 from .transform import (
@@ -71,6 +72,20 @@ class CollectorStats:
         with self._lock:
             self._counters[name] += amount
 
+    def record_diagnostics(self, agent: str, diagnostics: dict[str, int] | None) -> None:
+        """Record each transform diagnostic globally and per source.
+
+        Comparing one agent's trace shape against another needs the per-agent
+        split; the unscoped names stay for existing operational checks.
+        """
+
+        if not diagnostics:
+            return
+        with self._lock:
+            for name, amount in diagnostics.items():
+                self._counters[name] += amount
+                self._counters[f"agent.{agent}.{name}"] += amount
+
     def success(self) -> None:
         with self._lock:
             self._last_success_at = time.time()
@@ -99,10 +114,68 @@ class CollectorApplication:
         settings: Settings,
         *,
         forwarder: GalileoForwarder | Any | None = None,
+        aggregator: ConversationAggregator | None = None,
     ) -> None:
         self.settings = settings
         self.forwarder = forwarder or GalileoForwarder(settings)
         self.stats = CollectorStats()
+        if aggregator is not None:
+            self.aggregator: ConversationAggregator | None = aggregator
+        elif settings.aggregate_turns:
+            self.aggregator = ConversationAggregator(
+                idle_seconds=settings.turn_idle_seconds,
+                max_turn_records=settings.max_turn_records,
+                max_turn_bytes=settings.max_output_bytes,
+                max_total_records=settings.max_buffered_records,
+            )
+        else:
+            self.aggregator = None
+
+    def deliver(self, turn: ReleasedTurn) -> None:
+        """Transform and forward one released turn.
+
+        The agent's request already returned, so a failure here can only be
+        recorded. Nothing retries it: the collector has no durable spool.
+        """
+
+        self.stats.increment("turns_released")
+        self.stats.increment(f"turns_released.{turn.reason}")
+        self.stats.increment(f"agent.{turn.agent}.turns_released")
+        try:
+            transformed = logs_to_traces(
+                turn.request,
+                agent=turn.agent,
+                settings=self.settings,
+            )
+            if transformed.output_spans == 0:
+                self.stats.record_diagnostics(turn.agent, transformed.diagnostics)
+                return
+            if transformed.request.ByteSize() > self.settings.max_output_bytes:
+                self.stats.error("turn_too_large")
+                self.stats.increment("turns_dropped")
+                return
+            upstream = self.forwarder.export(
+                transformed.request,
+                log_stream=self.settings.routes[turn.agent],
+            )
+            rejected = max(0, upstream.rejected_spans)
+            self.stats.increment("logs_received", turn.records)
+            self.stats.increment("spans_forwarded", transformed.output_spans - rejected)
+            self.stats.increment(
+                f"agent.{turn.agent}.spans_forwarded",
+                transformed.output_spans - rejected,
+            )
+            self.stats.increment("items_rejected", rejected)
+            self.stats.record_diagnostics(turn.agent, transformed.diagnostics)
+            self.stats.success()
+        except UpstreamError as exc:
+            logger.warning("released turn was not delivered: HTTP %s", exc.status)
+            self.stats.error("deferred_upstream")
+            self.stats.increment("turns_dropped")
+        except Exception:
+            logger.exception("released turn failed to transform")
+            self.stats.error("deferred_internal")
+            self.stats.increment("turns_dropped")
 
     def process(
         self,
@@ -145,9 +218,25 @@ class CollectorApplication:
             self.stats.increment("traces_received", input_items)
             self.stats.increment("traces_suppressed", input_items)
             self.stats.increment(f"agent.{agent}.requests")
+            self.stats.increment(f"agent.{agent}.traces_suppressed", input_items)
             self.stats.success()
             return ProcessedResponse(
                 body=outbound_response.SerializeToString(),
+                input_items=input_items,
+                output_spans=0,
+                rejected_items=0,
+            )
+
+        if signal == "logs" and agent in _LOG_PRIMARY_AGENTS and self.aggregator is not None:
+            # Codex exports about one record per request. Hold the turn so its
+            # spans reach Galileo together, in the single request a trace gets.
+            for released in self.aggregator.add(agent, inbound):
+                self.deliver(released)
+            self.stats.increment("requests")
+            self.stats.increment(f"agent.{agent}.requests")
+            self.stats.increment("logs_buffered", input_items)
+            return ProcessedResponse(
+                body=ExportLogsServiceResponse().SerializeToString(),
                 input_items=input_items,
                 output_spans=0,
                 rejected_items=0,
@@ -165,8 +254,7 @@ class CollectorApplication:
             self.stats.increment("requests")
             self.stats.increment(f"{signal}_received", input_items)
             self.stats.increment(f"agent.{agent}.requests")
-            for name, amount in (transformed.diagnostics or {}).items():
-                self.stats.increment(name, amount)
+            self.stats.record_diagnostics(agent, transformed.diagnostics)
             self.stats.success()
             return ProcessedResponse(
                 body=outbound_response.SerializeToString(),
@@ -198,8 +286,8 @@ class CollectorApplication:
         self.stats.increment("spans_forwarded", transformed.output_spans - rejected)
         self.stats.increment("items_rejected", rejected)
         self.stats.increment(f"agent.{agent}.requests")
-        for name, amount in (transformed.diagnostics or {}).items():
-            self.stats.increment(name, amount)
+        self.stats.increment(f"agent.{agent}.spans_forwarded", transformed.output_spans - rejected)
+        self.stats.record_diagnostics(agent, transformed.diagnostics)
         self.stats.success()
         return ProcessedResponse(
             body=outbound_response.SerializeToString(),
@@ -220,7 +308,33 @@ class CollectorHTTPServer(ThreadingHTTPServer):
         port: int,
     ) -> None:
         self.application = application
+        self._stop_sweeper = threading.Event()
+        self._sweeper: threading.Thread | None = None
         super().__init__((LISTEN_HOST, port), CollectorRequestHandler)
+
+    def server_activate(self) -> None:
+        super().server_activate()
+        aggregator = self.application.aggregator
+        if aggregator is None:
+            return
+        # Not a daemon: shutdown has to drain held turns before the process exits.
+        self._sweeper = threading.Thread(
+            target=sweeper(
+                aggregator,
+                self.application.deliver,
+                interval_seconds=min(5.0, self.application.settings.turn_idle_seconds),
+                stop=self._stop_sweeper,
+            ),
+            name="allsky-turn-sweeper",
+        )
+        self._sweeper.start()
+
+    def server_close(self) -> None:
+        self._stop_sweeper.set()
+        if self._sweeper is not None:
+            self._sweeper.join(timeout=30)
+            self._sweeper = None
+        super().server_close()
 
 
 def _decompress_gzip(payload: bytes, maximum: int) -> bytes:

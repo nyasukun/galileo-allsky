@@ -4,11 +4,13 @@ import gzip
 import http.client
 import json
 import threading
+import time
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 import pytest
 from conftest import add_attribute, attributes_dict
@@ -151,6 +153,16 @@ def one_log(
     add_attribute(record.attributes, "user.email", "person@example.com")
     add_attribute(record.attributes, "prompt", "Bearer should-not-leak")
     return request
+
+
+def read_status(address: tuple[str, int]) -> dict[str, Any]:
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    try:
+        connection.request("GET", "/status")
+        response = connection.getresponse()
+        return json.loads(response.read())  # type: ignore[no-any-return]
+    finally:
+        connection.close()
 
 
 def post(
@@ -313,7 +325,9 @@ def test_all_six_allowlisted_routes_reach_only_the_stub(
         ]
 
     assert statuses == [200] * len(AGENTS)
-    assert [request.headers["logstream"] for request in state.requests] == list(AGENTS)
+    # Codex routes buffer their turn, so they are delivered when the server
+    # drains rather than in request order.
+    assert sorted(request.headers["logstream"] for request in state.requests) == sorted(AGENTS)
 
 
 def test_galileo_json_partial_success_is_translated_to_logs_partial(
@@ -333,12 +347,14 @@ def test_galileo_json_partial_success_is_translated_to_logs_partial(
         )
     )
 
+    # A synchronous route: partial success can only be relayed while the
+    # agent's request is still open.
     with running_collector(collector_settings(stub)) as address:
         status, _, body = post(
             address,
             "/v1/logs",
             one_log().SerializeToString(),
-            headers={"X-Allsky-Agent": "codex-cli"},
+            headers={"X-Allsky-Agent": "claude-code-cli"},
         )
 
     response = ExportLogsServiceResponse()
@@ -593,12 +609,13 @@ def test_normalized_output_limit_is_enforced_before_forwarding(
 ) -> None:
     state, stub = galileo_stub
 
+    # A synchronous route: only there can the limit answer the agent directly.
     with running_collector(collector_settings(stub, max_output_bytes=1024)) as address:
         status, _, body = post(
             address,
             "/v1/logs",
             one_log().SerializeToString(),
-            headers={"X-Allsky-Agent": "codex-cli"},
+            headers={"X-Allsky-Agent": "claude-code-cli"},
         )
 
     error = Status()
@@ -620,12 +637,13 @@ def test_retryable_upstream_status_is_propagated_once_with_retry_after(
         )
     )
 
+    # A synchronous route: a buffered turn has no agent request left to answer.
     with running_collector(collector_settings(stub)) as address:
         status, headers, body = post(
             address,
             "/v1/logs",
             one_log().SerializeToString(),
-            headers={"X-Allsky-Agent": "codex-cli"},
+            headers={"X-Allsky-Agent": "claude-code-cli"},
         )
 
     error = Status()
@@ -633,6 +651,82 @@ def test_retryable_upstream_status_is_propagated_once_with_retry_after(
     assert status == 503
     assert headers["retry-after"] == "2"
     assert error.code == 14
+    assert len(state.requests) == 1
+
+
+def test_codex_records_from_separate_requests_become_one_trace(
+    galileo_stub: tuple[GalileoStubState, GalileoStubServer],
+) -> None:
+    """Codex exports about one record per request; each used to be its own trace."""
+
+    state, stub = galileo_stub
+
+    with running_collector(collector_settings(stub)) as address:
+        for event_name in ("codex.user_prompt", "codex.sse_event", "codex.tool_result"):
+            status, _, _ = post(
+                address,
+                "/v1/logs",
+                one_log(event_name=event_name).SerializeToString(),
+                headers={"X-Allsky-Agent": "codex"},
+            )
+            assert status == 200
+        # Nothing has been forwarded yet: the turn is still open.
+        assert state.requests == []
+
+    assert len(state.requests) == 1
+    forwarded = ExportTraceServiceRequest()
+    forwarded.ParseFromString(state.requests[0].body)
+    spans = [
+        span
+        for resource_spans in forwarded.resource_spans
+        for scope_spans in resource_spans.scope_spans
+        for span in scope_spans.spans
+    ]
+
+    assert len(spans) == 3
+    assert len({span.trace_id for span in spans}) == 1
+    assert [span.name for span in spans] == [
+        "invoke_agent Codex",
+        "chat Codex",
+        "execute_tool unknown",
+    ]
+    assert spans[0].parent_span_id == b""
+    assert spans[1].parent_span_id == spans[0].span_id
+    assert spans[2].parent_span_id == spans[0].span_id
+
+
+def test_a_failed_turn_delivery_is_counted_and_not_propagated(
+    galileo_stub: tuple[GalileoStubState, GalileoStubServer],
+) -> None:
+    state, stub = galileo_stub
+    state.enqueue(StubResponse(status=503, body=b'{"detail":"unavailable"}'))
+
+    with running_collector(collector_settings(stub, turn_idle_seconds=1.0)) as address:
+        status, _, _ = post(
+            address,
+            "/v1/logs",
+            one_log().SerializeToString(),
+            headers={"X-Allsky-Agent": "codex"},
+        )
+        assert status == 200
+
+        counters = read_status(address)["counters"]
+        assert counters["logs_buffered"] == 1
+        assert "turns_released" not in counters
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            counters = read_status(address)["counters"]
+            if counters.get("turns_released"):
+                break
+            time.sleep(0.1)
+
+        assert counters["turns_released"] == 1
+        assert counters["turns_released.idle"] == 1
+        assert counters["turns_dropped"] == 1
+        assert counters["errors"] == 1
+        assert read_status(address)["last_error_type"] == "deferred_upstream"
+
     assert len(state.requests) == 1
 
 

@@ -158,6 +158,11 @@ systemctl --user restart galileo-allsky-collector.service
 | `ALLSKY_MAX_ITEMS_PER_REQUEST` | `10000` | 一 request の log record または span 上限 |
 | `ALLSKY_MAX_OUTPUT_BYTES` | `16777216` | 正規化後の trace batch 上限 |
 | `ALLSKY_FORWARD_TIMEOUT_SECONDS` | `5` | Galileo 一回分の timeout |
+| `ALLSKY_FORWARD_UNIDENTIFIED_LOGS` | `false` | allowlist で event を特定できない log record も span 化するか |
+| `ALLSKY_AGGREGATE_TURNS` | `true` | Codex の logs を会話単位で保持し 1 trace = 1 request で送るか |
+| `ALLSKY_TURN_IDLE_SECONDS` | `12` | turn を送り出すまでの無通信時間 |
+| `ALLSKY_MAX_TURN_RECORDS` | `2000` | 一 turn の record 上限 |
+| `ALLSKY_MAX_BUFFERED_RECORDS` | `50000` | 保持できる record の総数 |
 | `ALLSKY_LOG_LEVEL` | `info` | `debug`、`info`、`warning`、`error` のログレベル |
 
 dotenv parser は shell を実行せず、`NAME=value`、single quote、double quote、先頭の `export` だけを扱います。
@@ -215,6 +220,52 @@ process crash、長時間の Galileo 停止、Agent exporter が retry を諦め
 `/status` は件数、最終成功時刻、最終 error type を返します。
 
 Codex の相関確認では、`logs.grouping.conversation`、`logs.grouping.scope_inferred`、`logs.suppressed.uncorrelated_trace_id`、`traces_suppressed` を確認できます。
+
+変換 counter は送信元ごとにも記録します。`logs.event.codex.sse_event` と `agent.codex.logs.event.codex.sse_event` は同時に増えます。
+
+送信元ごとの trace の形は次の counter で比較します。
+
+| counter | 意味 |
+| --- | --- |
+| `logs.event.<event 名>` | 転送した log record の event 別内訳 |
+| `logs.suppressed.event.<event 名>` | 抑止した log record の event 別内訳 |
+| `logs.kind.<AGENT\|LLM\|TOOL>` | logs から作った span の分類別内訳 |
+| `traces.kind.<AGENT\|LLM\|TOOL>` | native traces の span の分類別内訳 |
+| `logs.traces_emitted`、`traces.traces_emitted` | 送出した trace 数の累計 |
+| `logs.spans_per_request.<範囲>`、`traces.spans_per_request.<範囲>` | 1 request の span 数の分布 |
+| `logs.traces_per_request.<範囲>`、`traces.traces_per_request.<範囲>` | 1 request の trace 数の分布 |
+
+event 名は allowlist で検証済みの値だけを使い、範囲は `1`、`2`、`3_5`、`6_10`、`11_25`、`26_100`、`over_100` に丸めます。
+
+`spans_forwarded` を `traces_emitted` で割ると、Log stream 上の 1 trace あたりの span 数になります。この値が 1 に近い送信元は trace が分断されています。
+
+Codex の turn 保持は次の counter で確認します。
+
+| counter | 意味 |
+| --- | --- |
+| `logs_buffered` | 保持した log record の累計 |
+| `turns_released` | 送り出した turn の累計 |
+| `turns_released.<turn_start\|idle\|turn_full\|capacity\|drain>` | 送り出した理由の内訳 |
+| `turns_dropped` | 送出時に失敗し失われた turn |
+
+`turns_dropped` が増える場合は `last_error_type` を確認します。`deferred_upstream` は Galileo への送信失敗で、Agent へは伝わりません。
+
+`turns_released.capacity` が増える場合は保持上限に達しています。`ALLSKY_MAX_BUFFERED_RECORDS` を上げるか `ALLSKY_TURN_IDLE_SECONDS` を下げます。
+
+allowlist で特定できなかった log record は既定で span 化せず、その形だけを次の counter に残します。
+
+| counter | 意味 |
+| --- | --- |
+| `logs.suppressed.unidentified` | 特定できず抑止した record 数 |
+| `logs.unnamed.event_name.<名前>` | 識別子の形をした event 名。空白を含む値は `unprintable` に丸めます |
+| `logs.unnamed.attribute.<キー>` | 付いていた属性の**キー**のみ |
+| `logs.unnamed.severity.<レベル>` | severity |
+
+値と body は counter に入りません。
+
+`logs.unnamed.event_name.*` に出た名前が Agent の正式な event であれば、`transform.py` の `_SAFE_EVENT_NAMES` に加えると分類対象になります。
+
+`logs.suppressed.unidentified` が急増し `spans_forwarded` が落ちる場合は、Agent 側の event 名が変わった可能性があります。切り分けの間は `ALLSKY_FORWARD_UNIDENTIFIED_LOGS=true` で従来の挙動へ戻せます。
 
 これらの counter は識別子の値や本文を保持しません。
 

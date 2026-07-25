@@ -170,6 +170,11 @@ class Settings:
     max_output_bytes: int = 16 * 1024 * 1024
     forward_timeout_seconds: float = 5.0
     allow_insecure_upstream: bool = False
+    forward_unidentified_logs: bool = False
+    aggregate_turns: bool = True
+    turn_idle_seconds: float = 12.0
+    max_turn_records: int = 2_000
+    max_buffered_records: int = 50_000
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -196,6 +201,16 @@ class Settings:
             raise ConfigurationError("ALLSKY_MAX_OUTPUT_BYTES must be between 1024 and 536870912")
         if not 0.1 <= self.forward_timeout_seconds <= 300:
             raise ConfigurationError("ALLSKY_FORWARD_TIMEOUT_SECONDS must be between 0.1 and 300")
+        if not 1 <= self.turn_idle_seconds <= 600:
+            raise ConfigurationError("ALLSKY_TURN_IDLE_SECONDS must be between 1 and 600")
+        if not 1 <= self.max_turn_records <= 100_000:
+            raise ConfigurationError("ALLSKY_MAX_TURN_RECORDS must be between 1 and 100000")
+        if self.max_buffered_records < self.max_turn_records:
+            raise ConfigurationError(
+                "ALLSKY_MAX_BUFFERED_RECORDS must be at least ALLSKY_MAX_TURN_RECORDS"
+            )
+        if self.max_buffered_records > 1_000_000:
+            raise ConfigurationError("ALLSKY_MAX_BUFFERED_RECORDS must not exceed 1000000")
         normalized_routes = {
             agent: _validate_header_value(AGENT_ENV_NAMES[agent], stream)
             for agent, stream in self.routes.items()
@@ -278,6 +293,33 @@ class Settings:
                 maximum=300,
             ),
             allow_insecure_upstream=allow_insecure,
+            forward_unidentified_logs=_boolean(
+                source,
+                "ALLSKY_FORWARD_UNIDENTIFIED_LOGS",
+                False,
+            ),
+            aggregate_turns=_boolean(source, "ALLSKY_AGGREGATE_TURNS", True),
+            turn_idle_seconds=_floating(
+                source,
+                "ALLSKY_TURN_IDLE_SECONDS",
+                12.0,
+                minimum=1,
+                maximum=600,
+            ),
+            max_turn_records=_integer(
+                source,
+                "ALLSKY_MAX_TURN_RECORDS",
+                2_000,
+                minimum=1,
+                maximum=100_000,
+            ),
+            max_buffered_records=_integer(
+                source,
+                "ALLSKY_MAX_BUFFERED_RECORDS",
+                50_000,
+                minimum=1,
+                maximum=1_000_000,
+            ),
         )
 
     def public_summary(self) -> dict[str, object]:
@@ -294,6 +336,11 @@ class Settings:
             "max_items_per_request": self.max_items_per_request,
             "max_output_bytes": self.max_output_bytes,
             "forward_timeout_seconds": self.forward_timeout_seconds,
+            "forward_unidentified_logs": self.forward_unidentified_logs,
+            "aggregate_turns": self.aggregate_turns,
+            "turn_idle_seconds": self.turn_idle_seconds,
+            "max_turn_records": self.max_turn_records,
+            "max_buffered_records": self.max_buffered_records,
         }
 
 

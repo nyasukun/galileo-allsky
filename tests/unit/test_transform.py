@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 from conftest import add_attribute, attributes_dict
@@ -107,6 +108,15 @@ def test_logs_are_one_to_one_valid_genai_spans(settings: Settings) -> None:
     assert transformed.diagnostics == {
         "logs.grouping.conversation": 3,
         "logs.grouping.scope_inferred": 2,
+        "logs.event.codex.user_prompt": 1,
+        "logs.event.codex.sse_event": 1,
+        "logs.event.codex.tool_result": 1,
+        "logs.kind.AGENT": 1,
+        "logs.kind.LLM": 1,
+        "logs.kind.TOOL": 1,
+        "logs.traces_emitted": 1,
+        "logs.spans_per_request.3_5": 1,
+        "logs.traces_per_request.1": 1,
     }
     assert [attributes_dict(span.attributes)["openinference.span.kind"] for span in spans] == [
         "AGENT",
@@ -352,6 +362,180 @@ def test_correlated_batches_use_distinct_traces_with_one_conversation_id() -> No
     )
 
 
+def test_claude_api_request_log_yields_to_its_native_trace_span(
+    settings: Settings,
+) -> None:
+    """The same model call arrives on both signals and would be stored twice."""
+
+    request = ExportLogsServiceRequest()
+    scope_logs = request.resource_logs.add().scope_logs.add()
+
+    duplicated = scope_logs.log_records.add()
+    duplicated.time_unix_nano = 10_000_000
+    duplicated.trace_id = b"\xaa" * 16
+    duplicated.span_id = b"\xbb" * 8
+    duplicated.event_name = "claude_code.api_request"
+    add_attribute(duplicated.attributes, "model", "claude-test")
+    add_attribute(duplicated.attributes, "input_tokens", 500)
+
+    kept = scope_logs.log_records.add()
+    kept.time_unix_nano = 20_000_000
+    kept.trace_id = b"\xaa" * 16
+    kept.span_id = b"\xbb" * 8
+    kept.event_name = "claude_code.assistant_response"
+
+    standalone = scope_logs.log_records.add()
+    standalone.time_unix_nano = 30_000_000
+    standalone.event_name = "claude_code.api_request"
+    add_attribute(standalone.attributes, "model", "claude-test")
+
+    transformed = logs_to_traces(request, agent="claude-code", settings=settings)
+    spans = _spans(transformed.request)
+
+    assert transformed.input_items == 3
+    assert transformed.output_spans == 2
+    assert [span.name for span in spans] == [
+        "chat Claude Code",
+        "chat claude-test",
+    ]
+    assert transformed.diagnostics is not None
+    assert transformed.diagnostics["logs.suppressed.duplicated_by_trace_span"] == 1
+    assert "logs.event.claude_code.api_request" in transformed.diagnostics
+
+
+def test_an_unidentified_record_reports_only_its_shape(settings: Settings) -> None:
+    """Codex sends records the allowlist cannot name; report schema, never content."""
+
+    request = ExportLogsServiceRequest()
+    record = request.resource_logs.add().scope_logs.add().log_records.add()
+    record.time_unix_nano = 10_000_000
+    record.event_name = "codex.thread_item"
+    record.severity_text = "INFO"
+    record.severity_number = 9
+    record.body.CopyFrom(python_to_any_value("PRIVATE-CANARY body text"))
+    add_attribute(record.attributes, "conversation.id", "c1")
+    add_attribute(record.attributes, "item_type", "PRIVATE-CANARY-value")
+    add_attribute(record.attributes, "Not A Key", "ignored")
+
+    transformed = logs_to_traces(request, agent="codex", settings=settings)
+    diagnostics = transformed.diagnostics or {}
+
+    assert diagnostics["logs.suppressed.unidentified"] == 1
+    assert diagnostics["logs.unnamed.event_name.codex.thread_item"] == 1
+    assert diagnostics["logs.unnamed.severity.INFO"] == 1
+    assert diagnostics["logs.unnamed.attribute.item_type"] == 1
+    assert diagnostics["logs.unnamed.attribute.conversation.id"] == 1
+    assert not any("Not A Key" in key for key in diagnostics)
+    assert not any("CANARY" in key for key in diagnostics)
+
+
+def test_an_unidentified_record_without_an_event_name_is_reported_as_absent(
+    settings: Settings,
+) -> None:
+    request = ExportLogsServiceRequest()
+    record = request.resource_logs.add().scope_logs.add().log_records.add()
+    record.time_unix_nano = 10_000_000
+    record.severity_number = 5
+    add_attribute(record.attributes, "conversation.id", "c1")
+
+    transformed = logs_to_traces(request, agent="codex", settings=settings)
+    diagnostics = transformed.diagnostics or {}
+
+    assert diagnostics["logs.unnamed.event_name.absent"] == 1
+    assert diagnostics["logs.unnamed.severity_number.5"] == 1
+
+
+def test_an_event_name_carried_in_an_attribute_is_reported(settings: Settings) -> None:
+    """Claude Code hook events leave the OTLP event_name empty and use event.name."""
+
+    request = ExportLogsServiceRequest()
+    record = request.resource_logs.add().scope_logs.add().log_records.add()
+    record.time_unix_nano = 10_000_000
+    add_attribute(record.attributes, "event.name", "claude_code.hook_execution")
+    add_attribute(record.attributes, "hook_name", "PRIVATE-CANARY-hook")
+
+    transformed = logs_to_traces(request, agent="claude-code", settings=settings)
+    diagnostics = transformed.diagnostics or {}
+
+    assert diagnostics["logs.unnamed.event_name.claude_code.hook_execution"] == 1
+    assert diagnostics["logs.unnamed.attribute.hook_name"] == 1
+    assert not any("CANARY" in key for key in diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("event_name", "expected"),
+    [
+        ("codex.Startup.Phase", "logs.unnamed.event_name.codex.Startup.Phase"),
+        ("SessionConfigured", "logs.unnamed.event_name.SessionConfigured"),
+        ("a failed login for person@example.com", "logs.unnamed.event_name.unprintable"),
+        ("x" * 200, "logs.unnamed.event_name.unprintable"),
+    ],
+)
+def test_only_whitespace_free_bounded_event_names_are_reported(
+    settings: Settings,
+    event_name: str,
+    expected: str,
+) -> None:
+    """A name with whitespace is a log message, not schema; never report it."""
+
+    request = ExportLogsServiceRequest()
+    record = request.resource_logs.add().scope_logs.add().log_records.add()
+    record.time_unix_nano = 10_000_000
+    record.event_name = event_name
+    add_attribute(record.attributes, "conversation.id", "c1")
+
+    transformed = logs_to_traces(request, agent="codex", settings=settings)
+    diagnostics = transformed.diagnostics or {}
+
+    assert diagnostics[expected] == 1
+    assert not any("example.com" in key for key in diagnostics)
+
+
+def test_codex_api_request_logs_are_never_dropped_as_duplicates(
+    settings: Settings,
+) -> None:
+    """Codex native traces are suppressed, so its log records are the only source."""
+
+    request = ExportLogsServiceRequest()
+    record = request.resource_logs.add().scope_logs.add().log_records.add()
+    record.time_unix_nano = 10_000_000
+    record.trace_id = b"\xaa" * 16
+    record.event_name = "codex.api_request"
+    add_attribute(record.attributes, "conversation.id", "c1")
+
+    transformed = logs_to_traces(request, agent="codex", settings=settings)
+
+    assert transformed.output_spans == 1
+    assert transformed.diagnostics is not None
+    assert "logs.suppressed.duplicated_by_trace_span" not in transformed.diagnostics
+
+
+def test_diagnostics_report_delivered_trace_fragmentation(settings: Settings) -> None:
+    """Two conversations in one request become two final, unmergeable traces.
+
+    Galileo rejects a later request that reuses a trace ID, so the trace count
+    a request emits is the trace count the log stream ends up with.
+    """
+
+    request = ExportLogsServiceRequest()
+    scope_logs = request.resource_logs.add().scope_logs.add()
+    for index, conversation in enumerate(("conversation-a", "conversation-b")):
+        record = scope_logs.log_records.add()
+        record.time_unix_nano = 10_000_000 * (index + 1)
+        record.event_name = "codex.user_prompt"
+        add_attribute(record.attributes, "conversation.id", conversation)
+
+    transformed = logs_to_traces(request, agent="codex", settings=settings, now_ns=100)
+    spans = _spans(transformed.request)
+
+    assert len({span.trace_id for span in spans}) == 2
+    assert transformed.diagnostics is not None
+    assert transformed.diagnostics["logs.traces_emitted"] == 2
+    assert transformed.diagnostics["logs.traces_per_request.2"] == 1
+    assert transformed.diagnostics["logs.spans_per_request.2"] == 1
+    assert transformed.diagnostics["logs.event.codex.user_prompt"] == 2
+
+
 def test_uncorrelated_codex_log_with_inbound_trace_id_is_suppressed(
     settings: Settings,
 ) -> None:
@@ -371,6 +555,7 @@ def test_uncorrelated_codex_log_with_inbound_trace_id_is_suppressed(
     assert transformed.output_spans == 0
     assert transformed.diagnostics == {
         "logs.suppressed.uncorrelated_trace_id": 1,
+        "logs.suppressed.event.codex.sse_event": 1,
     }
 
 
@@ -480,6 +665,49 @@ def test_trace_hierarchy_is_preserved_and_invalid_fields_are_repaired(
     assert len(invalid_out.trace_id) == 16
     assert len(invalid_out.span_id) == 8
     assert invalid_out.end_time_unix_nano > invalid_out.start_time_unix_nano > 0
+
+
+def test_tool_execution_span_inherits_the_tool_name_from_its_parent(
+    settings: Settings,
+) -> None:
+    """`claude_code.tool.execution` carries no tool_name, only a tool_use_id."""
+
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+
+    tool = scope.spans.add()
+    tool.trace_id = b"\x10" * 16
+    tool.span_id = b"\x20" * 8
+    tool.name = "claude_code.tool"
+    tool.start_time_unix_nano = 100
+    tool.end_time_unix_nano = 200
+    add_attribute(tool.attributes, "tool_name", "Bash")
+
+    execution = scope.spans.add()
+    execution.trace_id = tool.trace_id
+    execution.span_id = b"\x30" * 8
+    execution.parent_span_id = tool.span_id
+    execution.name = "claude_code.tool.execution"
+    execution.start_time_unix_nano = 110
+    execution.end_time_unix_nano = 190
+    add_attribute(execution.attributes, "tool_use_id", "toolu_1")
+
+    orphan = scope.spans.add()
+    orphan.trace_id = tool.trace_id
+    orphan.span_id = b"\x40" * 8
+    orphan.name = "claude_code.tool.execution"
+    orphan.start_time_unix_nano = 120
+    orphan.end_time_unix_nano = 180
+
+    transformed = normalize_traces(request, agent="claude-code", settings=settings)
+    tool_out, execution_out, orphan_out = _spans(transformed.request)
+
+    assert tool_out.name == "execute_tool Bash"
+    assert execution_out.name == "execute_tool Bash"
+    assert orphan_out.name == "execute_tool unknown"
+    assert transformed.diagnostics is not None
+    assert transformed.diagnostics["traces.tool_name.inherited"] == 1
+    assert transformed.diagnostics["traces.tool_name.unresolved"] == 1
 
 
 def test_trace_non_attribute_fields_and_reserved_values_are_sanitized(
@@ -630,10 +858,12 @@ def test_unknown_event_names_cannot_carry_content(settings: Settings) -> None:
     event = span.events.add()
     event.name = "claude_code.PRIVATE-CANARY-event"
 
+    # Forward the unidentified record so the redaction itself is under test,
+    # not the suppression that would otherwise hide it.
     logs_output = logs_to_traces(
         logs,
         agent="codex-cli",
-        settings=settings,
+        settings=replace(settings, forward_unidentified_logs=True),
         now_ns=100,
     ).request
     traces_output = normalize_traces(
@@ -646,6 +876,43 @@ def test_unknown_event_names_cannot_carry_content(settings: Settings) -> None:
     assert b"PRIVATE-CANARY" not in traces_output.SerializeToString()
     assert attributes_dict(_spans(logs_output)[0].attributes)["event.name"] == "codex-cli.log"
     assert _spans(traces_output)[0].events[0].name == "allsky.span_event"
+
+
+def test_an_unidentified_record_is_suppressed_by_default(settings: Settings) -> None:
+    """An unnamed log line is not an agent operation and must not become one."""
+
+    request = ExportLogsServiceRequest()
+    scope_logs = request.resource_logs.add().scope_logs.add()
+
+    startup = scope_logs.log_records.add()
+    startup.time_unix_nano = 10_000_000
+    startup.event_name = "codex.SessionConfigured"
+    add_attribute(startup.attributes, "conversation.id", "c1")
+    add_attribute(startup.attributes, "startup.phase", "auth")
+
+    prompt = scope_logs.log_records.add()
+    prompt.time_unix_nano = 20_000_000
+    prompt.event_name = "codex.user_prompt"
+    add_attribute(prompt.attributes, "conversation.id", "c1")
+
+    transformed = logs_to_traces(request, agent="codex", settings=settings)
+    diagnostics = transformed.diagnostics or {}
+
+    assert transformed.input_items == 2
+    assert transformed.output_spans == 1
+    assert [span.name for span in _spans(transformed.request)] == ["invoke_agent Codex"]
+    assert diagnostics["logs.suppressed.unidentified"] == 1
+    assert diagnostics["logs.unnamed.event_name.codex.SessionConfigured"] == 1
+    assert diagnostics["logs.unnamed.attribute.startup.phase"] == 1
+    assert "logs.event.codex.log" not in diagnostics
+
+    kept = logs_to_traces(
+        request,
+        agent="codex",
+        settings=replace(settings, forward_unidentified_logs=True),
+    )
+    assert kept.output_spans == 2
+    assert (kept.diagnostics or {})["logs.event.codex.log"] == 1
 
 
 @pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf")])
