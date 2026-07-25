@@ -873,9 +873,10 @@ def logs_to_traces(
     stream = settings.routes[agent]
     item_index = 0
     clock = time.time_ns() if now_ns is None else now_ns
-    # Galileo de-duplicates span IDs across separate OTLP requests. Keep the
-    # trace ID stable for a conversation, but choose its root only within this
-    # batch so a later user-prompt event cannot collide with an earlier root.
+    # Galileo does not reliably append spans when a later OTLP request reuses
+    # an existing trace ID. Correlate records within this request, then carry
+    # the conversation across requests only through gen_ai.conversation.id.
+    batch_trace_ids: dict[bytes, bytes] = {}
     batch_correlation_roots: dict[bytes, bytes] = {}
     diagnostics: Counter[str] = Counter()
 
@@ -947,18 +948,31 @@ def logs_to_traces(
                     diagnostics["logs.grouping.inbound_trace_id"] += 1
                 else:
                     diagnostics["logs.grouping.record_fallback"] += 1
-                trace_id = (
-                    _correlation_identifier(
+                if prefer_correlation_identity:
+                    correlation_key = _correlation_identifier(
                         length=16,
                         purpose="group-trace-id",
                         identity=correlation_identity,
                         secret=settings.pseudonym_secret,
                         agent=agent,
                     )
-                    if prefer_correlation_identity
-                    else log_record.trace_id
-                    if has_inbound_trace_id
-                    else _derived_identifier(
+                    trace_id = batch_trace_ids.get(correlation_key, b"")
+                    if not trace_id:
+                        trace_id = _derived_identifier(
+                            length=16,
+                            domain="logs-to-traces/correlation-batch-trace-id",
+                            secret=settings.pseudonym_secret,
+                            agent=agent,
+                            event_name=event_name,
+                            timestamp=source_timestamp,
+                            index=item_index,
+                            body=correlation_key.hex(),
+                        )
+                        batch_trace_ids[correlation_key] = trace_id
+                elif has_inbound_trace_id:
+                    trace_id = log_record.trace_id
+                else:
+                    trace_id = _derived_identifier(
                         length=16,
                         domain="logs-to-traces/trace-id",
                         secret=settings.pseudonym_secret,
@@ -968,7 +982,6 @@ def logs_to_traces(
                         index=item_index,
                         body=raw_body,
                     )
-                )
                 span_id = _derived_identifier(
                     length=8,
                     domain="logs-to-traces/span-id",

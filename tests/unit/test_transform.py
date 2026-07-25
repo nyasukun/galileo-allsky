@@ -300,7 +300,7 @@ def test_conversation_identity_takes_precedence_over_prompt_identity(
     assert spans[1].parent_span_id == spans[0].span_id
 
 
-def test_correlated_root_span_id_is_unique_across_separate_batches() -> None:
+def test_correlated_batches_use_distinct_traces_with_one_conversation_id() -> None:
     settings = Settings(
         api_key="key",
         project="project",
@@ -338,10 +338,14 @@ def test_correlated_root_span_id_is_unique_across_separate_batches() -> None:
         ).request
     )[0]
 
-    assert conversation_start.trace_id == user_prompt.trace_id
+    assert conversation_start.trace_id != user_prompt.trace_id
     assert conversation_start.span_id != user_prompt.span_id
     assert conversation_start.parent_span_id == b""
     assert user_prompt.parent_span_id == b""
+    assert (
+        attributes_dict(conversation_start.attributes)["gen_ai.conversation.id"]
+        == attributes_dict(user_prompt.attributes)["gen_ai.conversation.id"]
+    )
     assert (
         json.loads(attributes_dict(user_prompt.attributes)["gen_ai.input.messages"])[0]["content"]
         == "visible prompt"

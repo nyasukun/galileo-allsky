@@ -256,6 +256,46 @@ def test_logs_pipeline_uses_stub_and_returns_standard_binary_success(
     assert b"should-not-leak" not in captured.body
 
 
+def test_separate_correlated_batches_use_distinct_traces_and_keep_prompt(
+    galileo_stub: tuple[GalileoStubState, GalileoStubServer],
+) -> None:
+    state, stub = galileo_stub
+    settings = collector_settings(stub, capture_content=True)
+    conversation_start = one_log(event_name="codex.conversation_starts")
+    user_prompt = one_log(event_name="codex.user_prompt")
+    prompt_record = user_prompt.resource_logs[0].scope_logs[0].log_records[0]
+    for attribute in prompt_record.attributes:
+        if attribute.key == "prompt":
+            attribute.value.string_value = "visible prompt"
+
+    with running_collector(settings) as address:
+        statuses = [
+            post(
+                address,
+                "/v1/logs",
+                inbound.SerializeToString(),
+                headers={"X-Allsky-Agent": "codex"},
+            )[0]
+            for inbound in (conversation_start, user_prompt)
+        ]
+
+    assert statuses == [200, 200]
+    assert len(state.requests) == 2
+    forwarded = []
+    for captured in state.requests:
+        request = ExportTraceServiceRequest()
+        request.ParseFromString(captured.body)
+        forwarded.append(request.resource_spans[0].scope_spans[0].spans[0])
+
+    start_span, prompt_span = forwarded
+    start_attributes = attributes_dict(start_span.attributes)
+    prompt_attributes = attributes_dict(prompt_span.attributes)
+    assert start_span.trace_id != prompt_span.trace_id
+    assert start_span.parent_span_id == prompt_span.parent_span_id == b""
+    assert start_attributes["gen_ai.conversation.id"] == prompt_attributes["gen_ai.conversation.id"]
+    assert json.loads(prompt_attributes["gen_ai.input.messages"])[0]["content"] == "visible prompt"
+
+
 def test_all_six_allowlisted_routes_reach_only_the_stub(
     galileo_stub: tuple[GalileoStubState, GalileoStubServer],
 ) -> None:

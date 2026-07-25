@@ -14,8 +14,8 @@ collector の変換契約と、実際の Agent 接続で確認すべき範囲を
 
 | surface | 導入ガイドの OS | 接続手順 | collector が作る結果 | 自動 fixture の範囲 |
 | --- | --- | --- | --- | --- |
-| Codex Desktop | macOS | [あり](02-codex-opentelemetry.md) | logs から会話単位の Agent graph | Codex logs と trace 抑止 |
-| Codex CLI | macOS、Ubuntu | [あり](02-codex-opentelemetry.md) | logs から会話単位の Agent graph | Codex logs と trace 抑止 |
+| Codex Desktop | macOS | [あり](02-codex-opentelemetry.md) | logs から batch 単位の Agent graph | Codex logs と trace 抑止 |
+| Codex CLI | macOS、Ubuntu | [あり](02-codex-opentelemetry.md) | logs から batch 単位の Agent graph | Codex logs と trace 抑止 |
 | Claude Desktop の Local session | macOS、Ubuntu beta | [あり](03-claude-code-opentelemetry.md) | trace hierarchy と event span | Claude の主要 logs と traces |
 | Claude Code CLI | macOS、Ubuntu | [あり](03-claude-code-opentelemetry.md) | trace hierarchy と event span | Claude の主要 logs と traces |
 | Hermes Agent | macOS、Ubuntu | [hermes-galileo](08-hermes-agent.md) | plugin が Galileo に直接 trace と native Session を送信 | `hermes-galileo` の plugin contract は Ubuntu CI。macOS は実機受入が必要 |
@@ -37,7 +37,7 @@ Hermes の observer hook、native Session、direct SDK の契約は [hermes-gali
 - allowlist の route だけを固定した Log stream へ送る。
 - Agent request の Galileo routing 属性で送信先を上書きできない。
 - 転送対象の log record を一つの span へ変換する。
-- Codex の会話 ID を使って Agent root と子 span を構成する。
+- Codex の同一 OTLP batch を Agent root と子 span にまとめ、会話 ID は batch 間で同じ仮名属性にする。
 - Claude Code の既存 trace ID、parent ID、時刻を保ち、不正値だけを補う。
 - Codex native traces を正常応答で抑止し、Galileo へ重複送信しない。
 - prompt、response、tool payload を既定で送らず、secret、reasoning、raw identity を upstream protobuf に残さない。

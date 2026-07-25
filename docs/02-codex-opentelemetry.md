@@ -2,15 +2,19 @@
 
 ## 目的
 
-Codex の実行ログを collector へ送り、Galileo で会話単位の Agent graph として確認します。
+Codex の実行ログを collector へ送り、Galileo で Agent、LLM、Tool の graph として確認します。
 
 ## できること
 
 Codex Desktop は macOS、Codex CLI は macOS と Ubuntu で collector に接続できます。
 
-Codex の logs は user prompt、API event、tool decision、tool result などを含み、collector は会話 ID から Agent、LLM、Tool の親子関係を作ります。
+Codex の logs は user prompt、API event、tool decision、tool result などを含み、collector は一つの OTLP batch 内で Agent、LLM、Tool の親子関係を作ります。
 
-Codex の native traces も受信できますが、一会話で多数の小さな trace に分かれるため、collector は正常応答だけを返し、Galileo への転送には logs から作る会話単位の graph を使います。
+Codex の native traces も受信できますが、一会話で多数の小さな trace に分かれるため、collector は正常応答だけを返し、Galileo への転送には logs から作る graph を使います。
+
+同じ会話の log が複数の OTLP request に分かれた場合、後続 span の欠落を避けるため request ごとに別 trace として送ります。
+
+各 trace には同じ仮名化済み `gen_ai.conversation.id` が付くため、会話単位の検索と相関にはこの属性を使います。
 
 この設定は 2026-07-25 に公式の Codex telemetry と configuration reference で確認した内容です。
 

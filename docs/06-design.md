@@ -12,7 +12,9 @@ collector は、Agent が送る OTLP を Galileo が保存できる Agent、LLM�
 
 ## 得られる trace
 
-Codex の logs は会話 ID を使って一つの Agent root とその子 span にまとめます。
+Codex の logs は同じ OTLP batch 内で一つの Agent root とその子 span にまとめます。
+
+同じ会話が複数 batch に分かれた場合は batch ごとに別 trace ID を使い、仮名化した `gen_ai.conversation.id` で相関できるようにします。
 
 Claude Code の traces は、trace ID、span ID、parent ID、時刻、親子関係を維持しながら Galileo 向けに補正します。
 
@@ -26,7 +28,7 @@ Claude Code の traces は、trace ID、span ID、parent ID、時刻、親子関
 
 ## 変換の例
 
-Codex の一会話に `user_prompt`、API event、tool result がある場合、collector は最初の Agent span を root とし、後続の LLM と Tool span をその子にします。
+Codex の一つの OTLP batch に `user_prompt`、API event、tool result がある場合、collector は最初の Agent span を root とし、後続の LLM と Tool span をその子にします。
 
 Codex native trace は一会話で多数の trace ID に分かれるため、正常な OTLP 応答を返すだけで Galileo へは転送しません。
 
@@ -34,7 +36,7 @@ Claude Code の `claude_code.interaction`、`claude_code.llm_request`、`claude_
 
 `tool.output` span event がある場合は、content capture が有効なときだけ、秘密情報を除去して親 Tool span の output に反映します。
 
-このため、Galileo では Agent の一実行、モデル呼び出し、tool 実行を同じ trace でたどれます。
+このため、Galileo では同じ batch に入った Agent の実行、モデル呼び出し、tool 実行を同じ trace でたどれます。
 
 ## source の解決と logs の相関
 
@@ -42,7 +44,11 @@ Claude Code の `claude_code.interaction`、`claude_code.llm_request`、`claude_
 
 header がない場合は、`allsky.agent`、`agent.surface`、`service.name` の resource 属性が同じ supported source を示す request だけを受けます。
 
-logs に有効な trace ID がない場合は、`conversation.id`、`gen_ai.conversation.id`、`session.id`、必要に応じて `prompt.id` を使い、同じ会話に synthetic trace ID を付けます。
+logs に有効な trace ID がない場合は、`conversation.id`、`gen_ai.conversation.id`、`session.id`、必要に応じて `prompt.id` を使い、同じ batch の record に synthetic trace ID を付けます。
+
+同じ会話の後続 batch には別の synthetic trace ID を付けます。
+
+Galileo の direct OTLP endpoint へ送信済みの trace ID を再利用すると、後続 request が成功応答でも span が追記されない場合があるためです。
 
 raw の会話識別子は HMAC の入力にだけ使い、属性や trace ID として転送しません。
 
