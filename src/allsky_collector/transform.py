@@ -873,7 +873,10 @@ def logs_to_traces(
     stream = settings.routes[agent]
     item_index = 0
     clock = time.time_ns() if now_ns is None else now_ns
-    emitted_correlation_roots: set[bytes] = set()
+    # Galileo de-duplicates span IDs across separate OTLP requests. Keep the
+    # trace ID stable for a conversation, but choose its root only within this
+    # batch so a later user-prompt event cannot collide with an earlier root.
+    batch_correlation_roots: dict[bytes, bytes] = {}
     diagnostics: Counter[str] = Counter()
 
     for resource_logs in request.resource_logs:
@@ -977,25 +980,19 @@ def logs_to_traces(
                     body=raw_body,
                 )
                 correlation_root_span_id = (
-                    _correlation_identifier(
-                        length=8,
-                        purpose="root-span-id",
-                        identity=correlation_identity,
-                        secret=settings.pseudonym_secret,
-                        agent=agent,
-                    )
+                    batch_correlation_roots.get(trace_id, b"")
                     if prefer_correlation_identity
                     else b""
                 )
                 classification = _classify(event_name, raw_attributes)
                 is_correlation_root = (
-                    bool(correlation_root_span_id)
+                    prefer_correlation_identity
                     and classification == "AGENT"
-                    and correlation_root_span_id not in emitted_correlation_roots
+                    and not correlation_root_span_id
                 )
                 if is_correlation_root:
-                    span_id = correlation_root_span_id
-                    emitted_correlation_roots.add(correlation_root_span_id)
+                    correlation_root_span_id = span_id
+                    batch_correlation_roots[trace_id] = span_id
 
                 span = scope_spans.spans.add()
                 span.trace_id = trace_id

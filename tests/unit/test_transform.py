@@ -300,6 +300,54 @@ def test_conversation_identity_takes_precedence_over_prompt_identity(
     assert spans[1].parent_span_id == spans[0].span_id
 
 
+def test_correlated_root_span_id_is_unique_across_separate_batches() -> None:
+    settings = Settings(
+        api_key="key",
+        project="project",
+        capture_content=True,
+        pseudonym_secret="pseudonym",
+    )
+
+    def one_record(
+        event_name: str,
+        timestamp: int,
+        *,
+        prompt: str | None = None,
+    ) -> ExportLogsServiceRequest:
+        request = ExportLogsServiceRequest()
+        record = request.resource_logs.add().scope_logs.add().log_records.add()
+        record.event_name = event_name
+        record.time_unix_nano = timestamp
+        add_attribute(record.attributes, "conversation.id", "same-conversation")
+        if prompt is not None:
+            add_attribute(record.attributes, "prompt", prompt)
+        return request
+
+    conversation_start = _spans(
+        logs_to_traces(
+            one_record("codex.conversation_starts", 1),
+            agent="codex",
+            settings=settings,
+        ).request
+    )[0]
+    user_prompt = _spans(
+        logs_to_traces(
+            one_record("codex.user_prompt", 2, prompt="visible prompt"),
+            agent="codex",
+            settings=settings,
+        ).request
+    )[0]
+
+    assert conversation_start.trace_id == user_prompt.trace_id
+    assert conversation_start.span_id != user_prompt.span_id
+    assert conversation_start.parent_span_id == b""
+    assert user_prompt.parent_span_id == b""
+    assert (
+        json.loads(attributes_dict(user_prompt.attributes)["gen_ai.input.messages"])[0]["content"]
+        == "visible prompt"
+    )
+
+
 def test_uncorrelated_codex_log_with_inbound_trace_id_is_suppressed(
     settings: Settings,
 ) -> None:
