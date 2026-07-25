@@ -28,6 +28,10 @@ telemetry routing はユーザー設定 `~/.codex/config.toml` に置きます�
 
 プロジェクト配下の `.codex/config.toml` にある `[otel]` は telemetry routing に使われません。
 
+Codex を起動する shell または親 process に `OTEL_EXPORTER_OTLP_HEADERS` を設定しません。OpenTelemetry の process 環境にある header は、`~/.codex/config.toml` の exporter header より優先される場合があります。
+
+特に Claude Code 用の `X-Allsky-Agent=claude-code-cli` を `.bashrc`、`.zshrc` などへ global export すると、Codex telemetry まで Claude Code の Log stream へ誤配送されます。Claude 用の環境変数は `~/.claude/settings.json` または Claude process 専用 wrapper に限定します。
+
 Ubuntu で Codex の sandbox を使う場合は、必要に応じて公式の [Linux sandbox 前提条件](https://learn.chatgpt.com/docs/sandboxing#prerequisites)に従って `bubblewrap` を導入します。
 
 ## Codex Desktop の例
@@ -76,6 +80,14 @@ codex --strict-config --version
 codex --profile galileo-cli --strict-config --version
 ```
 
+起動環境に競合する OTLP header がないことも確認します。
+
+```sh
+env | grep '^OTEL_EXPORTER_OTLP_HEADERS='
+```
+
+何も表示されない状態で、新しい Codex process を開始します。表示された場合は親 shell の設定から除去し、shell と Codex を再起動します。
+
 collector の `/status` と Galileo の Log stream に到着が見えれば、接続は完了です。
 
 ## 本文を取得する場合
@@ -102,6 +114,8 @@ ChatGPT Desktop 内で実行する Codex task は、Codex の exporter が設定
 `X-Allsky-Agent` は設定例では必ず指定します。
 
 header を省略した request は resource 属性から送信元を解決できる場合がありますが、複数 source の混入を避けるため運用設定では header を固定します。
+
+`/status` で `agent.claude-code-cli.requests` だけが増え、`agent.codex.requests` が増えない場合は、Codex process が Claude 用の `OTEL_EXPORTER_OTLP_HEADERS` を継承していないか確認します。
 
 ## 公式資料
 

@@ -53,28 +53,49 @@ Ubuntu の Claude Desktop の導入と beta の機能差は、公式の [Claude 
 
 ## Claude Code CLI の例
 
-CLI を起動する shell または個人用 wrapper に次の値を設定します。
+CLI では `~/.claude/settings.json` の `env` に次の値を追加します。既存の `env` がある場合は同じ object へ統合します。
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_TRACES_EXPORTER": "otlp",
+    "OTEL_METRICS_EXPORTER": "none",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+    "OTEL_EXPORTER_OTLP_HEADERS": "X-Allsky-Agent=claude-code-cli"
+  }
+}
+```
+
+`.bashrc`、`.zshrc` などへ Claude 用の `OTEL_*` を global export しません。同じ shell から起動する Codex や他の OpenTelemetry 対応 process が値を継承し、`X-Allsky-Agent=claude-code-cli` で Claude Code の Log stream へ誤配送されるためです。
+
+一時的な検証で shell environment を使う場合も、値は `env` command で Claude process だけに渡します。
 
 ```sh
-export CLAUDE_CODE_ENABLE_TELEMETRY=1
-export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1
-
-export OTEL_LOGS_EXPORTER=otlp
-export OTEL_TRACES_EXPORTER=otlp
-export OTEL_METRICS_EXPORTER=none
-
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
-export OTEL_EXPORTER_OTLP_HEADERS="X-Allsky-Agent=claude-code-cli"
-
-claude
+env \
+  CLAUDE_CODE_ENABLE_TELEMETRY=1 \
+  CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 \
+  OTEL_LOGS_EXPORTER=otlp \
+  OTEL_TRACES_EXPORTER=otlp \
+  OTEL_METRICS_EXPORTER=none \
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+  OTEL_EXPORTER_OTLP_HEADERS=X-Allsky-Agent=claude-code-cli \
+  claude
 ```
 
 signal ごとに endpoint を分ける必要がある場合は、完全な path を設定します。
 
-```sh
-export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4318/v1/logs
-export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces
+```json
+{
+  "env": {
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:4318/v1/logs",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://127.0.0.1:4318/v1/traces"
+  }
+}
 ```
 
 collector が起動していることを確認し、秘密を含まない task を一つ実行します。
@@ -91,18 +112,26 @@ curl --fail http://127.0.0.1:4318/healthz
 
 prompt だけを取得する場合は、assistant response を明示的に無効化します。
 
-```sh
-export OTEL_LOG_USER_PROMPTS=1
-export OTEL_LOG_ASSISTANT_RESPONSES=0
+```json
+{
+  "env": {
+    "OTEL_LOG_USER_PROMPTS": "1",
+    "OTEL_LOG_ASSISTANT_RESPONSES": "0"
+  }
+}
 ```
 
 assistant response、tool detail、tool content まで取得する場合は、必要な項目だけを有効にします。
 
-```sh
-export OTEL_LOG_USER_PROMPTS=1
-export OTEL_LOG_ASSISTANT_RESPONSES=1
-export OTEL_LOG_TOOL_DETAILS=1
-export OTEL_LOG_TOOL_CONTENT=1
+```json
+{
+  "env": {
+    "OTEL_LOG_USER_PROMPTS": "1",
+    "OTEL_LOG_ASSISTANT_RESPONSES": "1",
+    "OTEL_LOG_TOOL_DETAILS": "1",
+    "OTEL_LOG_TOOL_CONTENT": "1"
+  }
+}
 ```
 
 `OTEL_LOG_TOOL_CONTENT=1` は Read の内容、Bash 出力、tool input、tool output を含み得ます。
@@ -126,6 +155,8 @@ Claude Code は Bash、hook、MCP server、language server へ `OTEL_*` exporter
 managed settings が generic endpoint を配布している環境では、signal 固有 endpoint が起動時に除去される場合があります。
 
 `claude --debug` の警告と組織設定を確認します。
+
+設定を変更した後は既存の Claude process へ反映されないため、新しい CLI process または Local session を開始します。
 
 現在の Claude Code は hook と、Agent tool が起動する subagent の child span も出し得ます。
 
