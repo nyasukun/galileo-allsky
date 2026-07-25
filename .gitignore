@@ -1,0 +1,30 @@
+# Secrets: keep actual values outside this repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Locally captured telemetry and temporary exports.
+otel-data/
+telemetry/
+traces/
+*.otel
+
+# Local machine files.
+.DS_Store
+
+# Python build and test artifacts.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/

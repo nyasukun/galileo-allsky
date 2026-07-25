@@ -1,0 +1,14 @@
+[Unit]
+Description=galileo-allsky local OTLP collector
+
+[Service]
+Type=simple
+WorkingDirectory=__ALLSKY_WORKDIR__
+ExecStart=__ALLSKY_COLLECTOR_EXECUTABLE__ --env-file __HOME__/.config/galileo-allsky/collector.env
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
