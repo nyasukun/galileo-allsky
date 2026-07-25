@@ -1,0 +1,178 @@
+name: dependency-watch
+
+on:
+  schedule:
+    # 05:11 JST. The non-round minute reduces load around the top of the hour.
+    - cron: "11 20 * * *"
+  workflow_dispatch:
+    inputs:
+      force_e2e:
+        description: Run the loopback E2E test even when the dependency closure is unchanged
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Resolve latest dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      updated: ${{ steps.versions.outputs.updated }}
+      resolved_json: ${{ steps.versions.outputs.resolved_json }}
+      baseline_resolved_json: ${{ steps.versions.outputs.baseline_resolved_json }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Resolve runtime and dev dependency closure
+        id: versions
+        run: python scripts/check_dependency_updates.py
+
+      - name: Summarize comparison
+        env:
+          BASELINE: ${{ steps.versions.outputs.baseline_resolved_json }}
+          LATEST: ${{ steps.versions.outputs.resolved_json }}
+          UPDATED: ${{ steps.versions.outputs.updated }}
+        run: |
+          {
+            echo "### Dependency watch"
+            echo
+            echo "- Python: \`3.12\`"
+            echo "- Update detected: **$UPDATED**"
+            echo
+            echo "<details><summary>Resolved dependency closure</summary>"
+            echo
+            echo "- Baseline: \`$BASELINE\`"
+            echo "- Latest: \`$LATEST\`"
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: Test latest dependency closure
+    needs: check
+    if: needs.check.outputs.updated == 'true' || inputs.force_e2e == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the exact detected dependency closure
+        env:
+          RESOLVED_JSON: ${{ needs.check.outputs.resolved_json }}
+        run: python scripts/install_test_stack.py --resolved-json "$RESOLVED_JSON"
+
+      - name: Lint the tested source
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Run loopback E2E test
+        run: pytest -v tests/integration
+
+      - name: Summarize E2E result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Latest dependency loopback E2E"
+            echo
+            echo "- Result: **$RESULT**"
+            echo "- Test: \`pytest -v tests/integration\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  baseline-pr:
+    name: Propose tested dependency baseline
+    needs: [check, e2e]
+    if: needs.check.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Record the successfully tested closure
+        env:
+          RESOLVED_JSON: ${{ needs.check.outputs.resolved_json }}
+        run: python scripts/check_dependency_updates.py --write --resolved-json "$RESOLVED_JSON"
+
+      - name: Commit and push automation branch
+        id: publish
+        run: |
+          branch="automation/dependency-baseline"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add .github/dependency-baseline.json
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "chore: update tested dependency baseline"
+          remote_sha="$(git ls-remote --heads origin "refs/heads/$branch" | awk '{print $1}')"
+          if [ -n "$remote_sha" ]; then
+            git push --force-with-lease="refs/heads/$branch:$remote_sha" origin "HEAD:refs/heads/$branch"
+          else
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or refresh dependency update PR
+        if: steps.publish.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOLVED_JSON: ${{ needs.check.outputs.resolved_json }}
+        run: |
+          branch="automation/dependency-baseline"
+          title="chore: update tested dependency baseline"
+          body="Automated daily dependency resolution and loopback E2E succeeded.
+
+          - Python: \`3.12\`
+          - Loopback E2E: \`pytest -v tests/integration\`
+          - Resolved closure: \`$RESOLVED_JSON\`
+
+          Workflow: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          pr_number="$(gh pr list --base main --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --title "$title" --body "$body"
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body "$body"
+          fi

@@ -1,0 +1,70 @@
+name: hermes-galileo-readme-watch
+
+on:
+  schedule:
+    # 05:29 JST. Kept separate from dependency resolution to avoid concurrent API work.
+    - cron: "29 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-galileo-readme-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check hermes-galileo README
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.readme.outputs.changed }}
+      baseline_sha: ${{ steps.readme.outputs.baseline_sha }}
+      latest_sha: ${{ steps.readme.outputs.latest_sha }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Check latest README commit
+        id: readme
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/check_hermes_readme_update.py
+
+  issue:
+    name: Open README review issue
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+
+    steps:
+      - name: Create an issue once per upstream README revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_SHA: ${{ needs.check.outputs.baseline_sha }}
+          LATEST_SHA: ${{ needs.check.outputs.latest_sha }}
+        run: |
+          title="docs: review hermes-galileo README update (${LATEST_SHA:0:12})"
+          existing="$(gh issue list --state all --search "$title in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+          if [ -n "$existing" ]; then
+            echo "Issue #$existing already records this README revision."
+            exit 0
+          fi
+          body="The tracked \`README.md\` revision in \`nyasukun/hermes-galileo\` changed.
+
+          - Tracking baseline: \`$BASELINE_SHA\`
+          - Latest README commit: \`$LATEST_SHA\`
+          - [View upstream commit](https://github.com/nyasukun/hermes-galileo/commit/$LATEST_SHA)
+          - [Compare with the tracking baseline](https://github.com/nyasukun/hermes-galileo/compare/$BASELINE_SHA...$LATEST_SHA)
+
+          Review whether [the Hermes integration guide](docs/08-hermes-agent.md) or the collector's documented compatibility assumptions need an update.
+
+          Created automatically by the daily upstream README watcher."
+          gh issue create --title "$title" --body "$body"
