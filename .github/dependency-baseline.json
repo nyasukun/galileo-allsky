@@ -1,16 +1,16 @@
 {
   "python": "3.12",
   "resolved": {
-    "coverage": "7.15.2",
-    "googleapis-common-protos": "1.75.0",
+    "coverage": "7.16.1",
+    "googleapis-common-protos": "1.75.3",
     "iniconfig": "2.3.0",
     "opentelemetry-proto": "1.44.0",
-    "packaging": "26.2",
+    "packaging": "26.3",
     "pluggy": "1.6.0",
-    "protobuf": "7.35.1",
-    "pygments": "2.20.0",
+    "protobuf": "7.36.2",
+    "pygments": "2.21.0",
     "pytest": "8.4.2",
     "pytest-cov": "7.1.0",
-    "ruff": "0.16.0"
+    "ruff": "0.16.8"
   }
 }
